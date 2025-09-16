@@ -109,12 +109,25 @@ def get_financial_data(ticker_symbol):
                 info = {}
 
         # 4) financial statements (each can be a separate call — throttle between them)
-        _throttle(1.2)
-        income_stmt = ticker.financials
-        _throttle(1.2)
-        balance_sheet = ticker.balance_sheet
-        _throttle(1.2)
-        quarterly_earnings = ticker.quarterly_earnings
+        # financial statements (each call can be rate-limited; keep them minimal)
+        income_stmt, balance_sheet, quarterly_earnings = None, None, None
+
+        try:
+            income_stmt = ticker.financials
+        except Exception:
+            income_stmt = None
+
+        try:
+            balance_sheet = ticker.balance_sheet
+        except Exception:
+            balance_sheet = None
+
+        # This one is the usual troublemaker — guard it.
+        try:
+            quarterly_earnings = ticker.quarterly_earnings
+        except Exception:
+            quarterly_earnings = None
+
 
         # 5) sanity checks similar to your original logic
         if (not info) or (info.get('regularMarketPrice') is None and "last_price" not in info):
@@ -132,6 +145,8 @@ def get_financial_data(ticker_symbol):
                 "⚠️ Yahoo Finance is temporarily rate-limiting data requests. "
                 "Please try again in a minute, or try a different ticker."
             )
+        elif "earnings" in err_text.lower():
+            st.warning("Yahoo's earnings endpoint is unavailable. Using other available data instead.")
         else:
             st.error(f"Failed to fetch data for {ticker_symbol}. Error: {e}")
         return None, None, None, None
