@@ -10,6 +10,38 @@ import nltk
 import plotly.graph_objects as go
 import shap
 import matplotlib.pyplot as plt
+# --- add near your imports ---
+import time, requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def _make_session():
+    s = requests.Session()
+    retry = Retry(
+        total=5,
+        backoff_factor=1.5,               # exponential backoff: 0s, 1.5s, 3s, 4.5s, ...
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD", "OPTIONS"]
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    })
+    return s
+
+_YF_SESSION = _make_session()
+
+def _throttle(min_interval=1.2):
+    # simple per-session delay between Yahoo hits to avoid bursts
+    last = st.session_state.get("_last_yf_call", 0.0)
+    now = time.time()
+    wait = min_interval - (now - last)
+    if wait > 0:
+        time.sleep(wait)
+    st.session_state["_last_yf_call"] = time.time()
+
 
 # --- Page Configuration ---
 st.set_page_config(page_title="Bankruptcy Risk Predictor", layout="wide")
@@ -56,19 +88,54 @@ FEATURE_DEFINITIONS = {
 @st.cache_data(ttl=3600)
 def get_financial_data(ticker_symbol):
     try:
-        ticker = yf.Ticker(ticker_symbol)
-        info = ticker.info
-        if not info or info.get('regularMarketPrice') is None:
-             raise ValueError(f"Ticker '{ticker_symbol}' not found or no data available.")
+        # 1) throttle and use a retrying session
+        _throttle(1.2)
+        ticker = yf.Ticker(ticker_symbol, session=_YF_SESSION)
+
+        # 2) use lighter endpoint first
+        info = {}
+        try:
+            # fast_info avoids the heavy quoteSummary spam
+            info = getattr(ticker, "fast_info", {}) or {}
+        except Exception:
+            info = {}
+
+        # 3) if you need company details that fast_info doesn't have, try .info with backoff
+        if not info or ("last_price" not in info and "regularMarketPrice" not in info):
+            _throttle(1.2)
+            try:
+                info = ticker.info or {}
+            except Exception:
+                info = {}
+
+        # 4) financial statements (each can be a separate call — throttle between them)
+        _throttle(1.2)
         income_stmt = ticker.financials
+        _throttle(1.2)
         balance_sheet = ticker.balance_sheet
+        _throttle(1.2)
         quarterly_earnings = ticker.quarterly_earnings
-        if income_stmt.empty or balance_sheet.empty:
-            return None, None, None, None
+
+        # 5) sanity checks similar to your original logic
+        if (not info) or (info.get('regularMarketPrice') is None and "last_price" not in info):
+            raise ValueError(f"Ticker '{ticker_symbol}' not found or no market price.")
+
+        if income_stmt is None or balance_sheet is None or income_stmt.empty or balance_sheet.empty:
+            return info, None, None, None
+
         return info, income_stmt, balance_sheet, quarterly_earnings
+
     except Exception as e:
-        st.error(f"Failed to fetch data for {ticker_symbol}. Error: {e}")
+        err_text = str(e)
+        if "429" in err_text or "Too Many Requests" in err_text:
+            st.warning(
+                "⚠️ Yahoo Finance is temporarily rate-limiting data requests. "
+                "Please try again in a minute, or try a different ticker."
+            )
+        else:
+            st.error(f"Failed to fetch data for {ticker_symbol}. Error: {e}")
         return None, None, None, None
+
 
 @st.cache_data(ttl=3600)
 def get_company_specific_news(query):
